@@ -1,4 +1,3 @@
-import os
 import re
 import subprocess
 import tempfile
@@ -10,13 +9,6 @@ from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(title="Vidalmo yt-dlp backend")
 
-
-class DownloadRequest(BaseModel):
-    url: HttpUrl
-    format: str = "mp4"
-    quality: str = "1080p"
-
-
 YOUTUBE_HOSTS = {
     "youtube.com",
     "www.youtube.com",
@@ -26,11 +18,10 @@ YOUTUBE_HOSTS = {
 }
 
 
-def safe_quality(value: str) -> str:
-    match = re.fullmatch(r"(144|240|360|480|720|1080|1440|2160)p", value)
-    if not match:
-        raise HTTPException(status_code=400, detail="Qualité invalide")
-    return match.group(1)
+class DownloadRequest(BaseModel):
+    url: HttpUrl
+    format: str = "mp4"
+    quality: str = "1080p"
 
 
 @app.get("/health")
@@ -40,79 +31,60 @@ def health():
 
 @app.post("/download")
 def download(payload: DownloadRequest):
-    url = str(payload.url)
-
     if payload.url.host not in YOUTUBE_HOSTS:
-        raise HTTPException(
-            status_code=400,
-            detail="Seuls les liens YouTube sont acceptés",
-        )
+        raise HTTPException(400, "Seuls les liens YouTube sont acceptés")
 
     if payload.format not in {"mp4", "mp3"}:
-        raise HTTPException(status_code=400, detail="Format invalide")
+        raise HTTPException(400, "Format invalide")
 
-    quality = safe_quality(payload.quality)
-    temp_dir = Path(tempfile.mkdtemp(prefix="vidalmo-"))
-    output = temp_dir / "download.%(ext)s"
+    match = re.fullmatch(r"(144|240|360|480|720|1080|1440|2160)p", payload.quality)
+    if not match:
+        raise HTTPException(400, "Qualité invalide")
+
+    folder = Path(tempfile.mkdtemp(prefix="vidalmo-"))
+    output = folder / "vidalmo.%(ext)s"
 
     if payload.format == "mp3":
-        format_selector = "bestaudio/best"
-        extra = [
+        command = [
+            "yt-dlp",
+            "--no-playlist",
+            "--max-filesize", "200M",
+            "--no-check-certificates",
             "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "192K",
+            "--audio-format", "mp3",
+            "--audio-quality", "192K",
+            "-o", str(output),
+            str(payload.url),
         ]
+        media_type = "audio/mpeg"
     else:
-        format_selector = (
-            f"bestvideo[height<={quality}]+bestaudio/"
-            f"best[height<={quality}]/best"
-        )
-        extra = ["--merge-output-format", "mp4"]
-
-    command = [
-        "yt-dlp",
-        "--no-playlist",
-        "--max-filesize",
-        "200M",
-        "--restrict-filenames",
-        "-f",
-        format_selector,
-        "-o",
-        str(output),
-        *extra,
-        url,
-    ]
+        height = match.group(1)
+        command = [
+            "yt-dlp",
+            "--no-playlist",
+            "--max-filesize", "200M",
+            "--no-check-certificates",
+            "-f", f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+            "--merge-output-format", "mp4",
+            "-o", str(output),
+            str(payload.url),
+        ]
+        media_type = "video/mp4"
 
     result = subprocess.run(
         command,
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=300,
     )
 
     if result.returncode != 0:
-        raise HTTPException(
-            status_code=502,
-            detail="Le téléchargement YouTube a échoué",
-        )
+        error = (result.stderr or result.stdout or "Erreur yt-dlp")[-1000:]
+        raise HTTPException(502, error)
 
-    files = [file for file in temp_dir.iterdir() if file.is_file()]
-
+    files = [file for file in folder.iterdir() if file.is_file()]
     if not files:
-        raise HTTPException(
-            status_code=502,
-            detail="Aucun fichier généré",
-        )
+        raise HTTPException(502, "Aucun fichier généré")
 
     file = files[0]
-    media_type = (
-        "audio/mpeg" if payload.format == "mp3" else "video/mp4"
-    )
-
-    return FileResponse(
-        file,
-        media_type=media_type,
-        filename=f"vidalmo.{file.suffix.lstrip('.')}",
-    )
+    return FileResponse(file, media_type=media_type, filename=file.name)
